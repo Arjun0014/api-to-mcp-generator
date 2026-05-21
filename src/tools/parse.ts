@@ -42,6 +42,8 @@ export async function parseSpec(
   authHeader?: string
 ): Promise<ParseResult> {
   const { rawBytes, specPath, tmpDir } = await fetchSpec(source, authHeader);
+  // Keep track of source URL for relative server URL resolution
+  const sourceUrl = source.type === "url" ? source.url : undefined;
 
   try {
     checkRawSize(rawBytes);
@@ -127,7 +129,7 @@ export async function parseSpec(
     return {
       title: doc.info.title,
       version: doc.info.version,
-      baseUrl: extractBaseUrl(doc),
+      baseUrl: extractBaseUrl(doc, sourceUrl),
       operationCount: operations.length,
       operations: operationSummaries,
       operationsByTag,
@@ -176,10 +178,24 @@ async function fetchSpec(
   }
 }
 
-function extractBaseUrl(doc: OpenAPIV3.Document): string {
+function extractBaseUrl(doc: OpenAPIV3.Document, sourceUrl?: string): string {
   const server = doc.servers?.[0];
   if (!server) return "";
-  return server.url;
+
+  const url = server.url;
+
+  // If the server URL is relative (e.g. "/api/v3"), resolve it against the source URL.
+  // This is valid OpenAPI 3.x — the spec assumes it's served at the same host.
+  if (url.startsWith("/") && sourceUrl) {
+    try {
+      const parsed = new URL(sourceUrl);
+      return `${parsed.protocol}//${parsed.host}${url}`;
+    } catch {
+      return url;
+    }
+  }
+
+  return url;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
