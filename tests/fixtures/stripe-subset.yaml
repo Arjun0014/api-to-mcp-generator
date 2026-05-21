@@ -1,0 +1,313 @@
+openapi: "3.0.0"
+info:
+  title: Stripe API Subset
+  version: "2024-06-20"
+  description: Subset of Stripe API covering allOf, discriminator, nullable, and oneOf patterns
+servers:
+  - url: https://api.stripe.com/v1
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    # allOf without discriminator (should produce intersection)
+    ChargeBase:
+      type: object
+      required:
+        - id
+        - amount
+      properties:
+        id:
+          type: string
+        amount:
+          type: integer
+        currency:
+          type: string
+    ChargeCard:
+      allOf:
+        - $ref: "#/components/schemas/ChargeBase"
+        - type: object
+          properties:
+            card_brand:
+              type: string
+            last4:
+              type: string
+    # allOf with discriminator (should produce unknown + warning)
+    PaymentMethod:
+      type: object
+      required:
+        - id
+        - type
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+    CardPaymentMethod:
+      allOf:
+        - $ref: "#/components/schemas/PaymentMethod"
+        - type: object
+          properties:
+            card:
+              type: object
+              properties:
+                brand:
+                  type: string
+                last4:
+                  type: string
+      discriminator:
+        propertyName: type
+    # nullable field
+    Customer:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+          nullable: true
+        name:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+    # oneOf
+    Address:
+      oneOf:
+        - type: object
+          properties:
+            line1:
+              type: string
+            city:
+              type: string
+            country:
+              type: string
+        - type: string
+          description: "Address as a single string"
+    # Error
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - message
+            - type
+          properties:
+            message:
+              type: string
+            type:
+              type: string
+            code:
+              type: string
+              nullable: true
+paths:
+  /charges:
+    get:
+      operationId: listCharges
+      summary: List all charges
+      tags:
+        - charges
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: starting_after
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: customer
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A list of charges
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ChargeCard"
+                  has_more:
+                    type: boolean
+        default:
+          description: Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      operationId: createCharge
+      summary: Create a charge
+      tags:
+        - charges
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - amount
+                - currency
+              properties:
+                amount:
+                  type: integer
+                currency:
+                  type: string
+                customer:
+                  type: string
+                description:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: Charge created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChargeCard"
+        default:
+          description: Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /charges/{charge}:
+    get:
+      operationId: retrieveCharge
+      summary: Retrieve a charge
+      tags:
+        - charges
+      parameters:
+        - name: charge
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The charge
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChargeCard"
+  /customers:
+    get:
+      operationId: listCustomers
+      summary: List customers
+      tags:
+        - customers
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: email
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Customer list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Customer"
+    post:
+      operationId: createCustomer
+      summary: Create a customer
+      tags:
+        - customers
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                name:
+                  type: string
+                metadata:
+                  type: object
+      responses:
+        "200":
+          description: Customer created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Customer"
+  /customers/{customer}:
+    get:
+      operationId: retrieveCustomer
+      summary: Retrieve a customer
+      tags:
+        - customers
+      parameters:
+        - name: customer
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The customer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Customer"
+    post:
+      operationId: updateCustomer
+      summary: Update a customer
+      tags:
+        - customers
+      parameters:
+        - name: customer
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                name:
+                  type: string
+      responses:
+        "200":
+          description: Updated customer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Customer"

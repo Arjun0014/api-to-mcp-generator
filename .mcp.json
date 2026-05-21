@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "api-to-mcp-generator": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "cwd": "C:\\MCP build\\api-to-mcp-generator"
+    }
+  }
+}
