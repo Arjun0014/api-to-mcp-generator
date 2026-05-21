@@ -86,6 +86,24 @@ export async function handleWriteServer(args: unknown) {
 
     const allWarnings = [...generated.warnings, ...formatWarnings, ...parsed.warnings];
 
+    // Security: warn if the spec was fetched from a URL (untrusted content may embed prompt injection)
+    if (input.source.type === "url") {
+      allWarnings.push(
+        `Security notice: tool descriptions in the generated server come directly from the spec at ${input.source.url}. ` +
+          `Only install generated servers from specs you trust. Verify tool descriptions before use.`
+      );
+    }
+    // Warn on suspiciously long descriptions (potential prompt injection vectors)
+    const longDescOps = operations.filter(
+      op => op.summary && op.summary.length > 300
+    );
+    if (longDescOps.length > 0) {
+      allWarnings.push(
+        `${longDescOps.length} operation(s) have unusually long summaries (>300 chars). ` +
+          `Review these tool descriptions for unexpected content: ${longDescOps.map(o => o.toolName).join(", ")}`
+      );
+    }
+
     // Build manifest
     const manifest: GenerationManifest = {
       generatorVersion: GENERATOR_VERSION,

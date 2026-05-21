@@ -44,6 +44,19 @@
 
 ---
 
+## P2: Upgrade vitest to 4.x (esbuild CVE GHSA-67mh-4wv8-2f99)
+
+**What:** `npm audit fix --force` to upgrade vitest 1.x → 4.x, fixing the esbuild dev server CORS bypass.
+
+**Why:** `esbuild ≤0.24.2` has a known CVE (dev server CORS bypass). Zero production risk (dev dep only, no UI), but keeps the audit clean.
+
+**Context:** Only exploitable if developer runs `vitest --ui` while browsing a malicious site. Standard CI runs (`npm test`) are not affected.
+
+**Effort:** S (human: ~30min to check for breaking API changes / CC: ~10min)
+**Depends on:** None — standalone upgrade
+
+---
+
 ## P3: Second protocol emitter (OpenAI function calling)
 
 **What:** `src/codegen/emitters/openai.ts` — emits OpenAI function calling JSON format from `NormalizedOperation[]`.
