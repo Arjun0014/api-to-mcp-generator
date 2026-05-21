@@ -139,12 +139,15 @@ export function validateOutputDir(outputDir: string): string {
     throw new Error(`Unsafe output directory: ${resolved}`);
   }
 
-  // Must be within home directory or a user-writable location
+  // Require the output path to be within the user's home directory or cwd.
+  // This is the second layer after the explicit blocklist above.
   const home = os.homedir();
   const cwd = process.cwd();
   if (!resolved.startsWith(home) && !resolved.startsWith(cwd)) {
-    // Allow any path outside home/cwd if it's not a blocked system path
-    // (the blocklist above is the primary guard)
+    throw new Error(
+      `Output directory must be within your home directory or current working directory. ` +
+        `Got: ${resolved}`
+    );
   }
 
   return resolved;
@@ -161,8 +164,18 @@ export function checkRawSize(bytes: Buffer | string, label = "Spec"): void {
 }
 
 export function checkDereferencedSize(doc: unknown): void {
-  const serialized = JSON.stringify(doc);
-  const size = Buffer.byteLength(serialized);
+  let size: number;
+  try {
+    const serialized = JSON.stringify(doc);
+    size = Buffer.byteLength(serialized);
+  } catch {
+    // JSON.stringify throws on circular references (swagger-parser may leave them).
+    // Treat a circular doc as oversized — it will cause infinite recursion in the normalizer.
+    throw new Error(
+      "Dereferenced spec contains circular references that cannot be serialized. " +
+        "The spec may use unsupported circular $ref patterns."
+    );
+  }
   if (size > DEREF_SPEC_SIZE_LIMIT) {
     const mb = (size / 1024 / 1024).toFixed(1);
     throw new Error(

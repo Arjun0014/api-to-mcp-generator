@@ -43,8 +43,10 @@ export async function handleGenerateSchemas(args: unknown) {
           `Use operation_ids to filter. Available tags: ${Object.keys(parsed.operationsByTag).join(", ")}`
       );
     }
+    // Build local warnings array — do NOT mutate parsed.warnings (it's a cached ParseResult)
+    const localWarnings = [...parsed.warnings];
     if (operations.length > 50) {
-      parsed.warnings.push(
+      localWarnings.push(
         `Large schema set (${operations.length} operations) — consider filtering by operation_ids`
       );
     }
@@ -74,7 +76,7 @@ export async function handleGenerateSchemas(args: unknown) {
       };
     });
 
-    return toolSuccess({ schemas, parse_warnings: parsed.warnings });
+    return toolSuccess({ schemas, parse_warnings: localWarnings });
   } catch (error) {
     return toolError(formatError(error));
   }

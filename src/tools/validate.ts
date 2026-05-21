@@ -155,6 +155,15 @@ async function runMcpProbe(
     const stdin = proc.stdin;
     const stdout = proc.stdout;
 
+    // settled + settle() guard prevents double-resolve across timeout/error/exit/rl paths
+    let settled = false;
+    function settle(result: { startsCheck: ValidationCheck; toolsCheck: ValidationCheck }) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(result);
+    }
+
     const timeout = setTimeout(() => {
       proc.kill();
       if (!startsCheck.passed) {
@@ -163,25 +172,23 @@ async function runMcpProbe(
       }
       toolsCheck.error = "MCP probe timeout";
       toolsCheck.elapsedMs = Date.now() - startTime;
-      resolve({ startsCheck, toolsCheck });
+      settle({ startsCheck, toolsCheck });
     }, PHASE_TIMEOUTS.server_starts + PHASE_TIMEOUTS.tools_list);
 
     const rl = createInterface({ input: stdout as NodeJS.ReadableStream });
     let initialized = false;
 
     proc.on("error", err => {
-      clearTimeout(timeout);
       startsCheck.error = err.message;
       startsCheck.elapsedMs = Date.now() - startTime;
-      resolve({ startsCheck, toolsCheck });
+      settle({ startsCheck, toolsCheck });
     });
 
     proc.on("exit", code => {
       if (!initialized) {
-        clearTimeout(timeout);
         startsCheck.error = `Process exited with code ${code} before responding`;
         startsCheck.elapsedMs = Date.now() - startTime;
-        resolve({ startsCheck, toolsCheck });
+        settle({ startsCheck, toolsCheck });
       }
     });
 
@@ -215,14 +222,13 @@ async function runMcpProbe(
             JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }) + "\n"
           );
         } else if (msg.id === 2) {
-          clearTimeout(timeout);
           const toolCount = (msg.result?.tools ?? []).length;
           toolsCheck.passed = toolCount > 0;
           toolsCheck.elapsedMs = Date.now() - startTime;
           toolsCheck.output = `${toolCount} tool(s) registered`;
           if (toolCount === 0) toolsCheck.error = "Server returned 0 tools";
           proc.kill();
-          resolve({ startsCheck, toolsCheck });
+          settle({ startsCheck, toolsCheck });
         }
       } catch {
         // non-JSON lines (startup messages) — ignore
@@ -272,7 +278,9 @@ async function runCommand(
     let proc: ReturnType<typeof spawn>;
 
     try {
-      proc = spawn(cmd, args, { cwd, shell: true });
+      // shell: false (default) — we don't need shell features and shell:true
+      // is a latent injection surface if cmd ever becomes dynamic
+      proc = spawn(cmd, args, { cwd });
     } catch (err) {
       resolve({
         name,

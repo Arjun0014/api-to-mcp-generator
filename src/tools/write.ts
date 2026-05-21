@@ -1,7 +1,6 @@
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import crypto from "crypto";
 import { z } from "zod";
 import prettier from "prettier";
 import { SpecSourceSchema, parseSpec } from "./parse.js";
@@ -160,7 +159,11 @@ async function writeAtomic(
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-gen-"));
   try {
     for (const [relPath, content] of Object.entries(files)) {
-      const dest = path.join(tmpDir, relPath);
+      const dest = path.resolve(path.join(tmpDir, relPath));
+      // Guard against emitter producing path-traversal keys like "../../../etc/passwd"
+      if (!dest.startsWith(tmpDir)) {
+        throw new Error(`Generated file key escapes output directory: ${relPath}`);
+      }
       await fs.mkdir(path.dirname(dest), { recursive: true });
       await fs.writeFile(dest, content, "utf8");
     }

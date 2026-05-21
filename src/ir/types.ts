@@ -55,11 +55,11 @@ export interface NormalizedOperation {
 
 // Context passed through normalizer recursion
 export interface NormCtx {
-  visited: WeakMap<object, true>;
+  visited: WeakSet<object>; // ancestor-chain tracker — add before recursing, delete after
   depth: number;
   seenToolNames: Set<string>;
 }
 
 export function makeNormCtx(): NormCtx {
-  return { visited: new WeakMap(), depth: 0, seenToolNames: new Set() };
+  return { visited: new WeakSet(), depth: 0, seenToolNames: new Set() };
 }

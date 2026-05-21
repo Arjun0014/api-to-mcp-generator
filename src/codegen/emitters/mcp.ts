@@ -9,6 +9,8 @@ import {
   generatedTsConfig,
 } from "../templates.js";
 
+const VALID_ENV_VAR = /^[A-Z_][A-Z0-9_]*$/;
+
 export class MCPEmitter {
   emit(ir: NormalizedOperation[], ctx: EmitterContext): GeneratedServer {
     const warnings: string[] = [];
@@ -19,6 +21,13 @@ export class MCPEmitter {
     }
 
     const authEnvVar = ctx.authEnvVar ?? defaultEnvVar(ctx.authType);
+
+    // Validate envVar is a legal identifier before embedding it in generated TypeScript
+    if (authEnvVar && !VALID_ENV_VAR.test(authEnvVar)) {
+      throw new Error(
+        `auth_env_var must be a valid environment variable name (uppercase letters, digits, underscores). Got: ${JSON.stringify(authEnvVar)}`
+      );
+    }
 
     const files: Record<string, string> = {
       "src/index.ts": this.buildIndexTs(ir, ctx, authEnvVar),
@@ -132,23 +141,20 @@ void (async () => {
 
   private buildCase(op: NormalizedOperation, ctx: EmitterContext): string {
     const schemaName = `${op.toolName}Schema`;
-    const pathArgs = op.parameters
-      .filter(p => p.in === "path")
-      .map(p => `"${p.name}": parsed.${sanitizeKey(p.name)}`);
+    // Use bracket notation for all parameter access — safe for non-identifier names like "x-request-id"
     const queryArgs = op.parameters
       .filter(p => p.in === "query")
-      .map(p => `"${p.name}": parsed.${sanitizeKey(p.name)}`);
+      .map(p => `${JSON.stringify(p.name)}: parsed[${JSON.stringify(p.name)}]`);
 
     const urlExpr = buildUrlExpr(op.path, op.parameters);
     const paramsExpr = queryArgs.length > 0
       ? `{ params: { ${queryArgs.join(", ")} } }`
       : "{}";
-    const dataExpr = op.requestBody ? ", parsed.body" : "";
 
     const methodCall = `await client.${op.method}(${urlExpr}, ${
       op.method === "get" || op.method === "delete"
         ? paramsExpr
-        : `${op.requestBody ? "parsed.body" : "undefined"}, ${paramsExpr}`
+        : `${op.requestBody ? "parsed[\"body\"]" : "undefined"}, ${paramsExpr}`
     })`;
 
     return `case ${JSON.stringify(op.toolName)}: {
@@ -279,22 +285,20 @@ function buildAuthInjection(
   }
 }
 
-function buildUrlExpr(path: string, params: NormalizedOperation["parameters"]): string {
+function buildUrlExpr(urlPath: string, params: NormalizedOperation["parameters"]): string {
   const pathParams = params.filter(p => p.in === "path");
-  if (pathParams.length === 0) return JSON.stringify(path);
-
-  let expr = JSON.stringify(path);
-  for (const p of pathParams) {
-    expr = expr.replace(`{${p.name}}`, `" + parsed.${sanitizeKey(p.name)} + "`);
-  }
-  // Clean up concatenation artifacts
-  expr = expr.replace(/^"" \+ /, "").replace(/ \+ ""$/, "");
-  if (!expr.startsWith('"') && !expr.startsWith("'")) return expr;
-  return "`" + path.replace(/\{(\w+)\}/g, (_, k) => `\${parsed.${sanitizeKey(k)}}`) + "`";
+  if (pathParams.length === 0) return JSON.stringify(urlPath);
+  // Always use template literal — safe for any param name including non-identifiers
+  const tmpl = urlPath.replace(
+    /\{([^}]+)\}/g,
+    (_, paramName: string) => `\${parsed[${JSON.stringify(paramName)}]}`
+  );
+  return `\`${tmpl}\``;
 }
 
 function sanitizeKey(key: string): string {
-  // If key is a valid JS identifier, use as-is; otherwise quote it
+  // Returns the key as a valid JS/TS property name.
+  // For Zod object keys and property access: valid identifiers used as-is, others quoted.
   if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key)) return key;
   return JSON.stringify(key);
 }

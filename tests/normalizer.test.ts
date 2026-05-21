@@ -150,7 +150,7 @@ describe("normalizeSchema — guards", () => {
   it("circular reference → kind:unknown + warning", () => {
     const c = ctx();
     const schema: OpenAPIV3.SchemaObject = { type: "object" };
-    c.visited.set(schema as object, true);
+    c.visited.add(schema as object); // WeakSet uses .add()
     const result = normalizeSchema(schema, c);
     expect(result.kind).toBe("unknown");
     if (result.kind === "unknown") {

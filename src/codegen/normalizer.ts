@@ -66,19 +66,29 @@ export function detectAuthSchemes(doc: OpenAPIV3.Document): DetectedAuthScheme[]
   return schemes;
 }
 
-// Exported for unit testing
+// Exported for unit testing.
+// Uses a per-traversal `currentPath` Set to detect true circular references
+// (the same object appearing as its own ancestor) without false-positiving on
+// shared schemas (the same object reused in multiple unrelated places).
 export function normalizeSchema(schema: OpenAPIV3.SchemaObject, ctx: NormCtx): NormalizedSchema {
   if (ctx.depth > 20) {
     return { kind: "unknown", warning: `schema too deeply nested (depth: ${ctx.depth})` };
   }
 
+  // ctx.visited tracks the current *ancestor chain* — add before recursing, remove after.
+  // This distinguishes true cycles from legitimate shared schemas.
   if (ctx.visited.has(schema as object)) {
     return { kind: "unknown", warning: "circular reference detected — manual review required" };
   }
-  ctx.visited.set(schema as object, true);
+  ctx.visited.add(schema as object);
 
   const child: NormCtx = { ...ctx, depth: ctx.depth + 1 };
-  return normalizeSchemaInner(schema, child);
+  const result = normalizeSchemaInner(schema, child);
+
+  // Remove from the ancestor chain after recursion so sibling schemas can reuse the same object
+  ctx.visited.delete(schema as object);
+
+  return result;
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
