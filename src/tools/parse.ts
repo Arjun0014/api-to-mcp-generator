@@ -4,12 +4,13 @@ import fs from "fs/promises";
 import os from "os";
 import path from "path";
 import { z } from "zod";
-import type { OpenAPIV3 } from "openapi-types";
+import type { OpenAPIV3, OpenAPIV2 } from "openapi-types";
 import { validateSourceUrl, validateFilePath, checkRawSize, checkDereferencedSize } from "../security/guards.js";
-import { normalizeSpec, detectAuthSchemes } from "../codegen/normalizer.js";
-import { hashSpec, getCachedIR, setCachedIR } from "../cache.js";
+import { normalizeDoc, detectAuthSchemes, detectAuthSchemesV2 } from "../codegen/normalizer.js";
+import { hashSpec, getCachedEntry, setCachedIR } from "../cache.js";
 import { toolSuccess, toolError } from "../types.js";
-import type { ParseResult, OperationSummary, SpecSource } from "../types.js";
+import type { ParseResult, OperationSummary, SpecSource, GroupingRecommendation, TagGroup } from "../types.js";
+import type { NormalizedOperation } from "../ir/types.js";
 
 // ─── Input schema ─────────────────────────────────────────────────────────────
 
@@ -42,7 +43,6 @@ export async function parseSpec(
   authHeader?: string
 ): Promise<ParseResult> {
   const { rawBytes, specPath, tmpDir } = await fetchSpec(source, authHeader);
-  // Keep track of source URL for relative server URL resolution
   const sourceUrl = source.type === "url" ? source.url : undefined;
 
   try {
@@ -50,86 +50,83 @@ export async function parseSpec(
 
     const specHash = hashSpec(rawBytes);
 
-    // Check cache — if hit, skip dereference + normalization entirely
-    let operations = getCachedIR(specHash);
-    let doc: OpenAPIV3.Document | null = null;
-    let normalizeWarnings: string[] = [];
+    // Cache HIT: skip dereference + normalization entirely.
+    // operationsByTag computed inline from op.tags (no re-parse needed).
+    // title/version/baseUrl from CacheEntry.metadata.
+    const cached = getCachedEntry(specHash);
+    if (cached) {
+      const operationSummaries = buildOperationSummaries(cached.ir);
+      const operationsByTag = buildOperationsByTagFromIR(cached.ir);
+      const opWarnings: string[] = [];
 
-    if (!operations) {
-      doc = await withTimeout(
-        SwaggerParser.dereference(specPath) as Promise<OpenAPIV3.Document>,
-        30_000,
-        "Spec parse timed out after 30s"
-      );
-
-      checkDereferencedSize(doc);
-
-      const normalized = normalizeSpec(doc);
-      operations = normalized.operations;
-      normalizeWarnings = normalized.warnings;
-      setCachedIR(specHash, operations);
-    } else {
-      // Re-parse for metadata (info, servers, paths) — but skip normalization
-      doc = await withTimeout(
-        SwaggerParser.dereference(specPath) as Promise<OpenAPIV3.Document>,
-        30_000,
-        "Spec parse timed out after 30s"
-      );
-    }
-
-    // Build operation summaries
-    const operationSummaries: OperationSummary[] = operations.map(op => ({
-      operationId: op.operationId,
-      toolName: op.toolName,
-      method: op.method,
-      path: op.path,
-      summary: op.summary,
-      hasRequestBody: op.requestBody !== undefined,
-      responseCodes: op.responses.map(r => r.statusCode),
-    }));
-
-    // Tag grouping
-    const operationsByTag: Record<string, OperationSummary[]> = {};
-    for (const [pathStr, pathItem] of Object.entries(doc.paths ?? {})) {
-      if (!pathItem || "$ref" in pathItem) continue;
-      const item = pathItem as OpenAPIV3.PathItemObject;
-      for (const method of ["get", "post", "put", "delete", "patch"] as const) {
-        const op = item[method];
-        if (!op) continue;
-        const tags = op.tags ?? ["untagged"];
-        const summary = operationSummaries.find(
-          s => s.path === pathStr && s.method === method
+      if (cached.ir.length > 50) {
+        opWarnings.push(
+          `Large spec (${cached.ir.length} operations) — consider filtering by tag using the tag parameter`
         );
-        if (!summary) continue;
-        for (const tag of tags) {
-          (operationsByTag[tag] ??= []).push(summary);
-        }
       }
+
+      const result: ParseResult = {
+        title: cached.metadata.title,
+        version: cached.metadata.version,
+        baseUrl: cached.metadata.baseUrl,
+        operationCount: cached.ir.length,
+        operations: operationSummaries,
+        operationsByTag,
+        detectedAuthSchemes: cached.metadata.detectedAuthSchemes,
+        specHash,
+        warnings: opWarnings,
+      };
+
+      if (cached.ir.length > 100) {
+        result.groupingRecommendation = buildGroupingRecommendation(
+          operationsByTag,
+          cached.metadata.title
+        );
+      }
+
+      return result;
     }
 
-    // Auth schemes
-    const detectedAuthSchemes = detectAuthSchemes(doc);
+    // Cache MISS — dereference, detect version, normalize.
+    const rawDoc = await withTimeout(
+      SwaggerParser.dereference(specPath) as Promise<OpenAPIV3.Document | OpenAPIV2.Document>,
+      30_000,
+      "Spec parse timed out after 30s"
+    );
 
-    // Operation count guard
+    checkDereferencedSize(rawDoc);
+
+    const isSwagger2 = (rawDoc as OpenAPIV2.Document).swagger === "2.0";
+    const { operations, namedSchemas, warnings: normalizeWarnings } = normalizeDoc(rawDoc);
+
+    const detectedAuthSchemes = isSwagger2
+      ? detectAuthSchemesV2(rawDoc as OpenAPIV2.Document)
+      : detectAuthSchemes(rawDoc as OpenAPIV3.Document);
+
+    const baseUrl = isSwagger2
+      ? extractBaseUrlV2(rawDoc as OpenAPIV2.Document)
+      : extractBaseUrl(rawDoc as OpenAPIV3.Document, sourceUrl);
+
+    const title = rawDoc.info.title;
+    const version = String(rawDoc.info.version ?? "");
+
+    // Store in cache with metadata and namedSchemas for use by write_mcp_server
+    setCachedIR(specHash, operations, namedSchemas, { title, version, baseUrl, detectedAuthSchemes });
+
+    const operationSummaries = buildOperationSummaries(operations);
+    const operationsByTag = buildOperationsByTagFromIR(operations);
+
     const opWarnings = [...normalizeWarnings];
-
-    if (operations.length > 100) {
-      throw new Error(
-        `Spec has ${operations.length} operations (limit: 100). ` +
-          `Use operation_ids to filter. Available tags: ${Object.keys(operationsByTag).join(", ")}`
-      );
-    }
-
     if (operations.length > 50) {
       opWarnings.push(
-        `Large spec (${operations.length} operations) — consider filtering by tag using operation_ids to focus generation`
+        `Large spec (${operations.length} operations) — consider filtering by tag using the tag parameter`
       );
     }
 
-    return {
-      title: doc.info.title,
-      version: doc.info.version,
-      baseUrl: extractBaseUrl(doc, sourceUrl),
+    const result: ParseResult = {
+      title,
+      version,
+      baseUrl,
       operationCount: operations.length,
       operations: operationSummaries,
       operationsByTag,
@@ -137,8 +134,13 @@ export async function parseSpec(
       specHash,
       warnings: opWarnings,
     };
+
+    if (operations.length > 100) {
+      result.groupingRecommendation = buildGroupingRecommendation(operationsByTag, title);
+    }
+
+    return result;
   } finally {
-    // Clean up temp directory created for URL-fetched specs
     if (tmpDir) {
       await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
     }
@@ -146,6 +148,68 @@ export async function parseSpec(
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function buildOperationSummaries(operations: NormalizedOperation[]): OperationSummary[] {
+  return operations.map(op => ({
+    operationId: op.operationId,
+    toolName: op.toolName,
+    method: op.method,
+    path: op.path,
+    summary: op.summary,
+    hasRequestBody: op.requestBody !== undefined,
+    responseCodes: op.responses.map(r => r.statusCode),
+  }));
+}
+
+// Build operationsByTag from normalized IR operations.
+// Uses op.tags (V2 addition). Ops with no tags fall into "_untagged".
+// No doc re-parse needed — works from cached IR on both HIT and MISS paths.
+function buildOperationsByTagFromIR(
+  operations: NormalizedOperation[]
+): Record<string, OperationSummary[]> {
+  const result: Record<string, OperationSummary[]> = {};
+  for (const op of operations) {
+    const tags = [...new Set(op.tags.length > 0 ? op.tags : ["_untagged"])];
+    const summary: OperationSummary = {
+      operationId: op.operationId,
+      toolName: op.toolName,
+      method: op.method,
+      path: op.path,
+      summary: op.summary,
+      hasRequestBody: op.requestBody !== undefined,
+      responseCodes: op.responses.map(r => r.statusCode),
+    };
+    for (const tag of tags) {
+      (result[tag] ??= []).push(summary);
+    }
+  }
+  return result;
+}
+
+function buildGroupingRecommendation(
+  operationsByTag: Record<string, OperationSummary[]>,
+  specTitle: string
+): GroupingRecommendation {
+  const slugBase = specTitle
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "") || "api";
+
+  const groups: TagGroup[] = Object.entries(operationsByTag)
+    .sort((a, b) => b[1].length - a[1].length)
+    .map(([tag, ops]) => ({
+      tag,
+      count: ops.length,
+      suggestedServer: `${slugBase}-${tag.replace(/^_/, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "misc"}`,
+    }));
+
+  return {
+    strategy: "generate_by_tag",
+    groups,
+    totalGroups: groups.length,
+    fitsInOneServer: false,
+  };
+}
 
 async function fetchSpec(
   source: SpecSource,
@@ -159,12 +223,10 @@ async function fetchSpec(
       headers: authHeader ? { Authorization: authHeader } : {},
       timeout: 30_000,
       maxContentLength: 10 * 1024 * 1024,
-      maxRedirects: 0, // prevent redirect-based SSRF bypass
+      maxRedirects: 0,
     });
 
     const rawBytes = Buffer.from(response.data);
-
-    // Write to temp file for swagger-parser (requires a path)
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-spec-"));
     const ext = source.url.endsWith(".json") ? ".json" : ".yaml";
     const specPath = path.join(tmpDir, `spec${ext}`);
@@ -183,9 +245,6 @@ function extractBaseUrl(doc: OpenAPIV3.Document, sourceUrl?: string): string {
   if (!server) return "";
 
   const url = server.url;
-
-  // If the server URL is relative (e.g. "/api/v3"), resolve it against the source URL.
-  // This is valid OpenAPI 3.x — the spec assumes it's served at the same host.
   if (url.startsWith("/") && sourceUrl) {
     try {
       const parsed = new URL(sourceUrl);
@@ -196,6 +255,17 @@ function extractBaseUrl(doc: OpenAPIV3.Document, sourceUrl?: string): string {
   }
 
   return url;
+}
+
+function extractBaseUrlV2(doc: OpenAPIV2.Document): string {
+  const host = doc.host;
+  if (!host) return "";
+
+  const basePath = doc.basePath ?? "";
+  const schemes = doc.schemes ?? ["https"];
+  const scheme = schemes.includes("https") ? "https" : (schemes[0] ?? "https");
+
+  return `${scheme}://${host}${basePath}`;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
