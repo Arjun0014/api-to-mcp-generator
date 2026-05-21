@@ -10,6 +10,7 @@ export type NormalizedSchema =
     }
   | { kind: "union"; variants: NormalizedSchema[]; nullable: boolean } // oneOf / anyOf
   | { kind: "intersection"; parts: NormalizedSchema[] } // allOf
+  | { kind: "lazy"; refName: string } // circular self-reference — emitted as z.lazy()
   | { kind: "unknown"; warning: string }; // unnormalizable
 
 export interface NormalizedAuth {
@@ -46,6 +47,7 @@ export interface NormalizedOperation {
   path: string;
   summary: string;
   description?: string;
+  tags: string[]; // OpenAPI operation tags — used for tag-based filtering
   parameters: NormalizedParameter[];
   requestBody?: NormalizedRequestBody;
   responses: NormalizedResponse[];
@@ -56,10 +58,19 @@ export interface NormalizedOperation {
 // Context passed through normalizer recursion
 export interface NormCtx {
   visited: WeakSet<object>; // ancestor-chain tracker — add before recursing, delete after
+  // Maps schema objects → their components.schemas key name.
+  // Populated in Pass 1 (components.schemas loop) BEFORE Pass 2 (doc.paths loop).
+  // Used by circular detection to emit { kind: "lazy", refName } instead of { kind: "unknown" }.
+  componentNames: WeakMap<object, string>;
   depth: number;
   seenToolNames: Set<string>;
 }
 
 export function makeNormCtx(): NormCtx {
-  return { visited: new WeakSet(), depth: 0, seenToolNames: new Set() };
+  return {
+    visited: new WeakSet(),
+    componentNames: new WeakMap(),
+    depth: 0,
+    seenToolNames: new Set(),
+  };
 }

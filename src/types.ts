@@ -23,10 +23,26 @@ export interface OperationSummary {
 
 export interface DetectedAuthScheme {
   name: string; // securityScheme key from spec
-  type: "bearer" | "api_key_header" | "api_key_query";
+  type: "bearer" | "api_key_header" | "api_key_query" | "oauth_client_credentials";
   envVar: string;
   headerName?: string;
   queryParam?: string;
+  tokenEndpoint?: string; // OAuth clientCredentials: token URL from spec's tokenUrl field
+}
+
+// ─── Grouping recommendation ──────────────────────────────────────────────────
+
+export interface TagGroup {
+  tag: string;
+  count: number;
+  suggestedServer: string; // e.g. "stripe-charges"
+}
+
+export interface GroupingRecommendation {
+  strategy: "generate_by_tag";
+  groups: TagGroup[];
+  totalGroups: number;
+  fitsInOneServer: boolean;
 }
 
 export interface ParseResult {
@@ -39,6 +55,7 @@ export interface ParseResult {
   detectedAuthSchemes: DetectedAuthScheme[];
   specHash: string;
   warnings: string[];
+  groupingRecommendation?: GroupingRecommendation; // present when operationCount > 100
 }
 
 // ─── Generated server ─────────────────────────────────────────────────────────
@@ -61,7 +78,7 @@ export interface GenerationManifest {
   options: {
     serverName: string;
     baseUrl: string;
-    authType: NormalizedAuth["type"];
+    authType: NormalizedAuth["type"] | "oauth_client_credentials";
     authEnvVar?: string;
   };
 }
