@@ -129,12 +129,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           base_url: { type: "string", description: "Override the base URL from the spec" },
           auth_type: {
             type: "string",
-            enum: ["none", "bearer", "api_key_header", "api_key_query"],
+            enum: ["none", "bearer", "api_key_header", "api_key_query", "oauth_client_credentials"],
             description: "Auth type — auto-detected from spec if omitted",
           },
           auth_env_var: {
             type: "string",
             description: "Env var name for auth token (e.g. BEARER_TOKEN)",
+          },
+          tag: {
+            type: "string",
+            description: "Generate only operations from this tag group (mutually exclusive with operation_ids)",
           },
           operation_ids: {
             type: "array",
