@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { normalizeSchema, normalizeSpec } from "../src/codegen/normalizer.js";
+import { normalizeSchema, normalizeSpec, normalizeDoc, detectAuthSchemes, detectAuthSchemesV2 } from "../src/codegen/normalizer.js";
 import { makeNormCtx } from "../src/ir/types.js";
-import type { OpenAPIV3 } from "openapi-types";
+import type { OpenAPIV3, OpenAPIV2 } from "openapi-types";
 
 function ctx() {
   return makeNormCtx();
@@ -147,15 +147,194 @@ describe("normalizeSchema — guards", () => {
     }
   });
 
-  it("circular reference → kind:unknown + warning", () => {
+  it("anonymous circular (no componentName) → kind:unknown + warning", () => {
     const c = ctx();
     const schema: OpenAPIV3.SchemaObject = { type: "object" };
-    c.visited.add(schema as object); // WeakSet uses .add()
+    c.visited.add(schema as object);
     const result = normalizeSchema(schema, c);
     expect(result.kind).toBe("unknown");
     if (result.kind === "unknown") {
       expect(result.warning).toContain("circular");
     }
+  });
+
+  it("named circular (componentName registered) → kind:lazy with refName", () => {
+    const c = ctx();
+    const schema: OpenAPIV3.SchemaObject = { type: "object" };
+    c.visited.add(schema as object);
+    c.componentNames.set(schema as object, "Category");
+    const result = normalizeSchema(schema, c);
+    expect(result.kind).toBe("lazy");
+    if (result.kind === "lazy") {
+      expect(result.refName).toBe("Category");
+    }
+  });
+});
+
+describe("detectAuthSchemes — V3 oauth2 clientCredentials", () => {
+  it("detects clientCredentials flow → oauth_client_credentials", () => {
+    const doc = {
+      openapi: "3.0.0",
+      info: { title: "T", version: "1" },
+      paths: {},
+      components: {
+        securitySchemes: {
+          OAuth2: {
+            type: "oauth2",
+            flows: {
+              clientCredentials: {
+                tokenUrl: "https://auth.example.com/token",
+                scopes: {},
+              },
+            },
+          },
+        },
+      },
+    } as OpenAPIV3.Document;
+    const schemes = detectAuthSchemes(doc);
+    const oauth = schemes.find(s => s.type === "oauth_client_credentials");
+    expect(oauth).toBeDefined();
+    expect(oauth?.tokenEndpoint).toBe("https://auth.example.com/token");
+  });
+});
+
+describe("normalizeSpec — namedSchemas + tags", () => {
+  const docWithCircular = (): OpenAPIV3.Document => ({
+    openapi: "3.0.0",
+    info: { title: "Test", version: "1.0.0" },
+    paths: {
+      "/categories": {
+        get: {
+          operationId: "list_categories",
+          summary: "List categories",
+          tags: ["categories"],
+          responses: { "200": { description: "ok" } },
+        },
+      },
+    },
+    components: {
+      schemas: {
+        Category: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+          },
+        },
+      },
+    },
+  });
+
+  it("normalizeSpec returns namedSchemas record", () => {
+    const { namedSchemas } = normalizeSpec(docWithCircular());
+    expect(namedSchemas).toBeDefined();
+    expect(namedSchemas["Category"]).toBeDefined();
+  });
+
+  it("operations include tags: string[]", () => {
+    const { operations } = normalizeSpec(docWithCircular());
+    expect(operations[0]?.tags).toEqual(["categories"]);
+  });
+
+  it("operations with no tags have tags: []", () => {
+    const doc: OpenAPIV3.Document = {
+      openapi: "3.0.0",
+      info: { title: "T", version: "1" },
+      paths: {
+        "/x": {
+          get: { operationId: "get_x", summary: "x", responses: { "200": { description: "ok" } } },
+        },
+      },
+    };
+    const { operations } = normalizeSpec(doc);
+    expect(operations[0]?.tags).toEqual([]);
+  });
+});
+
+describe("Swagger 2.0 adapter", () => {
+  const swagger2Doc = (): OpenAPIV2.Document => ({
+    swagger: "2.0",
+    info: { title: "Pet API", version: "1.0" },
+    host: "petstore.example.com",
+    basePath: "/v2",
+    schemes: ["https"],
+    paths: {
+      "/pets": {
+        get: {
+          operationId: "listPets",
+          summary: "List pets",
+          tags: ["pets"],
+          parameters: [],
+          responses: { "200": { description: "A list" } },
+        },
+      },
+    },
+    definitions: {
+      Pet: {
+        type: "object",
+        properties: {
+          id: { type: "integer" },
+          name: { type: "string", "x-nullable": true } as unknown as OpenAPIV2.SchemaObject,
+        },
+        required: ["id"],
+      },
+    },
+  } as unknown as OpenAPIV2.Document);
+
+  it("normalizeDoc routes swagger:2.0 correctly", () => {
+    const { operations } = normalizeDoc(swagger2Doc());
+    expect(operations.length).toBeGreaterThan(0);
+    expect(operations[0]?.toolName).toBe("list_pets");
+  });
+
+  it("operations from Swagger 2.0 include tags", () => {
+    const { operations } = normalizeDoc(swagger2Doc());
+    expect(operations[0]?.tags).toEqual(["pets"]);
+  });
+
+  it("x-nullable: true maps to nullable: true on string field", () => {
+    const { namedSchemas } = normalizeDoc(swagger2Doc());
+    const pet = namedSchemas["Pet"];
+    expect(pet).toBeDefined();
+    if (pet?.kind === "object") {
+      const nameProp = pet.properties["name"]?.schema;
+      expect(nameProp?.kind).toBe("string");
+      if (nameProp?.kind === "string") {
+        expect(nameProp.nullable).toBe(true);
+      }
+    }
+  });
+
+  it("detectAuthSchemesV2 handles apiKey in header", () => {
+    const doc = {
+      swagger: "2.0",
+      info: { title: "T", version: "1" },
+      securityDefinitions: {
+        ApiKeyAuth: { type: "apiKey", in: "header", name: "X-Api-Key" },
+      },
+      paths: {},
+    } as unknown as OpenAPIV2.Document;
+    const schemes = detectAuthSchemesV2(doc);
+    expect(schemes[0]?.type).toBe("api_key_header");
+    expect(schemes[0]?.headerName).toBe("X-Api-Key");
+  });
+
+  it("detectAuthSchemesV2 handles oauth2 flow:application → oauth_client_credentials", () => {
+    const doc = {
+      swagger: "2.0",
+      info: { title: "T", version: "1" },
+      securityDefinitions: {
+        OAuth2: {
+          type: "oauth2",
+          flow: "application",
+          tokenUrl: "https://auth.example.com/token",
+          scopes: {},
+        },
+      },
+      paths: {},
+    } as unknown as OpenAPIV2.Document;
+    const schemes = detectAuthSchemesV2(doc);
+    expect(schemes[0]?.type).toBe("oauth_client_credentials");
+    expect(schemes[0]?.tokenEndpoint).toBe("https://auth.example.com/token");
   });
 });
 

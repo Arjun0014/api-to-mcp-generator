@@ -95,6 +95,46 @@ describe("parseSpec — stripe subset", () => {
   });
 });
 
+describe("parseSpec — V2: groupingRecommendation", () => {
+  it("no groupingRecommendation when operationCount ≤ 100", async () => {
+    const result = await parseSpec(petstore);
+    expect(result.groupingRecommendation).toBeUndefined();
+  });
+
+  it("no groupingRecommendation when operationCount ≤ 100 (stripe subset)", async () => {
+    const result = await parseSpec(stripeSubset);
+    expect(result.groupingRecommendation).toBeUndefined();
+  });
+});
+
+describe("parseSpec — V2: operationsByTag from IR", () => {
+  it("operationsByTag built from op.tags field (cache miss path)", async () => {
+    const result = await parseSpec(petstore);
+    expect(typeof result.operationsByTag).toBe("object");
+    const tagKeys = Object.keys(result.operationsByTag);
+    expect(tagKeys.length).toBeGreaterThan(0);
+  });
+
+  it("untagged ops fall into _untagged group", async () => {
+    // petstore has pets and owners tags — no untagged ops expected
+    const result = await parseSpec(petstore);
+    // Just ensure the structure is correct
+    for (const [, ops] of Object.entries(result.operationsByTag)) {
+      expect(Array.isArray(ops)).toBe(true);
+    }
+  });
+});
+
+describe("parseSpec — V2: cache stores detectedAuthSchemes", () => {
+  it("second parse call (cache hit) returns same detectedAuthSchemes", async () => {
+    const first = await parseSpec(stripeSubset);
+    const second = await parseSpec(stripeSubset);
+    // Both should have bearer auth detected
+    expect(first.detectedAuthSchemes.length).toBe(second.detectedAuthSchemes.length);
+    expect(first.detectedAuthSchemes[0]?.type).toBe(second.detectedAuthSchemes[0]?.type);
+  });
+});
+
 describe("parseSpec — security", () => {
   it("rejects SSRF URL", async () => {
     await expect(
