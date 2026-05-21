@@ -164,17 +164,19 @@ export function checkRawSize(bytes: Buffer | string, label = "Spec"): void {
 }
 
 export function checkDereferencedSize(doc: unknown): void {
+  // V2: the normalizer handles circular $ref patterns via WeakSet ancestor tracking
+  // and emits z.lazy() instead of infinitely recursing. JSON.stringify failure is no
+  // longer a reason to reject — specs like Stripe have circular schemas that are valid.
+  // If JSON.stringify fails (circular object graph), estimate size via object traversal
+  // with a visited Set to avoid infinite loops; apply the same 25MB guard.
   let size: number;
   try {
     const serialized = JSON.stringify(doc);
     size = Buffer.byteLength(serialized);
   } catch {
-    // JSON.stringify throws on circular references (swagger-parser may leave them).
-    // Treat a circular doc as oversized — it will cause infinite recursion in the normalizer.
-    throw new Error(
-      "Dereferenced spec contains circular references that cannot be serialized. " +
-        "The spec may use unsupported circular $ref patterns."
-    );
+    // Circular object reference — JSON.stringify can't measure size directly.
+    // Walk the object graph with cycle detection to estimate string size.
+    size = estimateObjectSize(doc);
   }
   if (size > DEREF_SPEC_SIZE_LIMIT) {
     const mb = (size / 1024 / 1024).toFixed(1);
@@ -182,4 +184,31 @@ export function checkDereferencedSize(doc: unknown): void {
       `Dereferenced spec too large: ${mb}MB (limit: 25MB). This spec has heavy $ref expansion.`
     );
   }
+}
+
+// Estimate the serialized size of a potentially-circular object graph.
+// Uses a WeakSet to skip already-visited objects (cycle break).
+function estimateObjectSize(value: unknown, visited = new WeakSet<object>()): number {
+  if (value === null || value === undefined) return 4;
+  if (typeof value === "boolean") return 5;
+  if (typeof value === "number") return 8;
+  if (typeof value === "string") return Buffer.byteLength(value) + 2;
+  if (typeof value !== "object") return 0;
+
+  const obj = value as object;
+  if (visited.has(obj)) return 0; // cycle — skip (already counted on first visit)
+  visited.add(obj);
+
+  let size = 2; // {} or []
+  if (Array.isArray(obj)) {
+    for (const item of obj as unknown[]) {
+      size += estimateObjectSize(item, visited) + 1; // +1 for comma
+    }
+  } else {
+    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+      size += Buffer.byteLength(k) + 3; // "key":
+      size += estimateObjectSize(v, visited) + 1; // value + comma
+    }
+  }
+  return size;
 }

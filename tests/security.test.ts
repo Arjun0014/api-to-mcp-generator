@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateSourceUrl, validateOutputDir, validateFilePath } from "../src/security/guards.js";
+import { validateSourceUrl, validateOutputDir, validateFilePath, checkDereferencedSize } from "../src/security/guards.js";
 
 describe("validateSourceUrl", () => {
   it("allows https:// URL", () => {
@@ -101,5 +101,27 @@ describe("validateFilePath", () => {
   it("blocks /etc/passwd on Unix", () => {
     if (process.platform === "win32") return;
     expect(() => validateFilePath("/etc/passwd")).toThrow("path traversal protection");
+  });
+});
+
+describe("checkDereferencedSize", () => {
+  it("passes a normal small doc", () => {
+    expect(() => checkDereferencedSize({ info: { title: "T", version: "1" }, paths: {} })).not.toThrow();
+  });
+
+  it("passes a doc with circular object references (does NOT throw)", () => {
+    // This is the Stripe scenario: swagger-parser dereferences a spec with circular
+    // $refs and produces a JS object graph with cycles. V2 normalizer handles these
+    // via WeakSet — checkDereferencedSize must not reject them.
+    const a: Record<string, unknown> = { name: "A" };
+    const b: Record<string, unknown> = { name: "B", ref: a };
+    a["ref"] = b; // circular: a → b → a
+    expect(() => checkDereferencedSize({ paths: {}, components: { schemas: { A: a } } })).not.toThrow();
+  });
+
+  it("throws on oversized doc", () => {
+    // Simulate a doc that exceeds 25MB when serialised
+    const big = { data: "x".repeat(26 * 1024 * 1024) };
+    expect(() => checkDereferencedSize(big)).toThrow("too large");
   });
 });
