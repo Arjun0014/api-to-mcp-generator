@@ -143,9 +143,10 @@ export function validateOutputDir(outputDir: string): string {
   // This is the second layer after the explicit blocklist above.
   const home = os.homedir();
   const cwd = process.cwd();
-  if (!resolved.startsWith(home) && !resolved.startsWith(cwd)) {
+  const tmp = os.tmpdir();
+  if (!resolved.startsWith(home) && !resolved.startsWith(cwd) && !resolved.startsWith(tmp)) {
     throw new Error(
-      `Output directory must be within your home directory or current working directory. ` +
+      `Output directory must be within your home directory, current working directory, or temp directory. ` +
         `Got: ${resolved}`
     );
   }
