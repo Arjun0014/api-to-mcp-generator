@@ -227,3 +227,50 @@ describe("write_mcp_server — generated content", () => {
     await fs.rm(outDir, { recursive: true, force: true });
   });
 });
+
+describe("write_mcp_server — V2: tag filter", () => {
+  it("tag filter returns only matching operations", async () => {
+    const outDir = await tmpDir();
+    const result = await handleWriteServer({
+      source: petstore,
+      output_dir: outDir,
+      server_name: "petstore-pets",
+      tag: "pets",
+      dry_run: true,
+    });
+    expect(result.isError).toBeFalsy();
+    const data = JSON.parse(result.content[0].text);
+    expect(data.dry_run).toBe(true);
+    expect(data.files["src/index.ts"]).toBeDefined();
+    await fs.rm(outDir, { recursive: true, force: true }).catch(() => undefined);
+  });
+
+  it("tag with no matching ops → isError with available tags", async () => {
+    const outDir = await tmpDir();
+    const result = await handleWriteServer({
+      source: petstore,
+      output_dir: outDir,
+      server_name: "petstore-test",
+      tag: "nonexistent_tag_xyz",
+      dry_run: true,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("nonexistent_tag_xyz");
+    expect(result.content[0].text).toContain("Available tags");
+    await fs.rm(outDir, { recursive: true, force: true }).catch(() => undefined);
+  });
+
+  it("tag and operation_ids together → mutually exclusive error", async () => {
+    // mutual exclusion check fires before output_dir validation
+    const result = await handleWriteServer({
+      source: petstore,
+      output_dir: os.tmpdir(),
+      server_name: "petstore-test",
+      tag: "pets",
+      operation_ids: ["listPets"],
+      dry_run: true,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("cannot be used together");
+  });
+});

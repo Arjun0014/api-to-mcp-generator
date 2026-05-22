@@ -1,42 +1,127 @@
 # api-to-mcp-generator
 
-> A compiler pipeline that turns any OpenAPI 3.x spec into a production-ready TypeScript MCP server — with Zod validation, auth injection, MCP config, and end-to-end probe validation.
+**Turn any REST API into a Claude-ready MCP server in under 60 seconds.**
 
-Point it at any REST API spec. Get a working, Claude-ready MCP server in under a minute.
+No template dumping. No manual tool definitions. A proper compiler pipeline — normalised IR, strict TypeScript, Zod validation, auto-detected auth — that works on the APIs you actually encounter in the field: Stripe, Jira, Salesforce, HubSpot.
 
 ```
-OpenAPI 3.x spec (URL or file)
-  → Normalized IR (NormalizedOperation[])
-    → TypeScript MCP server
-        ├── Zod-validated tool inputs
-        ├── axios HTTP client with auth injection
-        ├── .mcp.json for Claude Desktop / Claude Code
-        ├── Generation manifest (provenance + reproducibility)
-        └── README
+OpenAPI 3.x / Swagger 2.0 spec  →  Normalised IR  →  TypeScript MCP server
+       (URL or file)                    (IR cache)        (tsc-clean, Claude-ready)
 ```
+
+[![CI](https://github.com/Arjun0014/api-to-mcp-generator/actions/workflows/ci.yml/badge.svg)](https://github.com/Arjun0014/api-to-mcp-generator/actions/workflows/ci.yml)
 
 ---
 
-## Why this exists
+## The problem
 
-Most OpenAPI → MCP converters are template dumps. They take an endpoint, rename it, and call it a tool. That breaks on real-world specs: `oneOf`, `allOf`, nullable fields, circular refs, missing `operationId`s, path params vs query params vs body — all produce silent failures or malformed schemas.
+Every time a Forward Deployed Engineer onboards a client API for a Claude integration, they write the same boilerplate: MCP tool definitions, Zod input schemas, axios client with auth injection, `.mcp.json` config. For a 20-endpoint API that's half a day. For Stripe's 400+ endpoints it's a week.
 
-This generator uses an **intermediate representation layer**. Every OpenAPI schema type normalises once into `NormalizedOperation[]`, and every downstream tool — Zod schema generation, TypeScript codegen, validation — works off that single correct IR. The result is deterministic output regardless of how messy the source spec is.
+Template-based generators exist but they break on real-world specs. `oneOf` becomes `z.unknown()`. Circular `$ref` schemas crash. Missing `operationId`s produce collisions. Nullable fields get dropped. Auth wiring is left to the developer.
 
-It also guards against the biggest LLM usability failure: generating 400 tools from a large API. Claude can't reason over 400 tools. This generator warns at 50, refuses at 100, and supports tag-based filtering so you work with the slice of the API you actually need.
+**This is a compiler, not a template.** Every OpenAPI schema variant normalises once into a typed IR (`NormalizedOperation[]`). Everything downstream — Zod schemas, TypeScript codegen, validation, README — works off that single correct representation. The result is deterministic output that compiles clean and passes a live MCP protocol probe.
 
 ---
 
-## Installation
+## What's different in V2
+
+V1 worked on clean specs. V2 works on enterprise APIs.
+
+| Problem | V1 | V2 |
+|---------|----|----|
+| Stripe has 400+ endpoints | Hard refuses at >100 | `groupingRecommendation` splits by tag; `tag` filter generates one group |
+| Circular `$ref` schemas | Falls back to `z.unknown()` | Emits proper `z.lazy(() => CategorySchema)` |
+| Jira / Salesforce are Swagger 2.0 | Rejects the spec | Native adapter — `definitions`, `basePath`, `x-nullable`, `securityDefinitions` |
+| HubSpot / Salesforce use OAuth M2M | Warning only | Generated `client.ts` auto-fetches tokens with `OAUTH_CLIENT_ID` + `OAUTH_CLIENT_SECRET` |
+| Re-parsing the same spec on every call | Second `dereference()` on cache hit | IR cached with metadata; `operationsByTag` computed from `op.tags` inline |
+
+---
+
+## How it works
+
+```
+                         ┌─────────────────────────────────────────────────────┐
+                         │              api-to-mcp-generator                    │
+                         │                                                       │
+  OpenAPI 3.x ──────────►│  validateSourceUrl()  ──►  SwaggerParser.dereference │
+  Swagger 2.0 ──────────►│  (SSRF + size guards)      (resolves all $refs)      │
+  (URL or file)          │              │                                        │
+                         │              ▼                                        │
+                         │   normalizeDoc()  ◄─── version detection             │
+                         │      │                                                │
+                         │      ├─ normalizeSpec()       ← OpenAPI 3.x path     │
+                         │      └─ normalizeSwagger2Doc() ← Swagger 2.0 path    │
+                         │              │                                        │
+                         │              ▼                                        │
+                         │   NormalizedOperation[]  +  namedSchemas             │
+                         │   (IR: typed, deduplicated, tag-annotated)           │
+                         │              │                                        │
+                         │    SHA-256-keyed session cache                       │
+                         │              │                                        │
+                         │              ▼                                        │
+                         │   MCPEmitter.emit(ir, "mcp", ctx)                   │
+                         │      │                                                │
+                         │      ├─ buildIndexTs()   → src/index.ts              │
+                         │      │    Zod schemas, tool defs, HTTP dispatch      │
+                         │      ├─ buildClientTs()  → src/client.ts             │
+                         │      │    Bearer / API key / OAuth clientCredentials  │
+                         │      └─ package.json, tsconfig.json, .mcp.json       │
+                         └─────────────────────────────────────────────────────┘
+
+  Generated server output:
+  ┌───────────────────────────────────────────────────────┐
+  │  src/index.ts       MCP server — tools + dispatch     │
+  │  src/client.ts      axios client + auth injection     │
+  │  package.json       ready to npm install              │
+  │  tsconfig.json      strict TypeScript                 │
+  │  .env.example       auth env var placeholders         │
+  │  .mcp.json          Claude Desktop / Claude Code      │
+  │  .mcp-generator-manifest.json  provenance record      │
+  └───────────────────────────────────────────────────────┘
+```
+
+### The IR layer
+
+The normalizer is the heart of the compiler. Every OpenAPI schema variant maps to one of these IR kinds:
+
+```typescript
+type NormalizedSchema =
+  | { kind: "string";       enum?: string[]; format?: string; nullable: boolean }
+  | { kind: "number";       integer: boolean; nullable: boolean }
+  | { kind: "boolean";      nullable: boolean }
+  | { kind: "array";        items: NormalizedSchema; nullable: boolean }
+  | { kind: "object";       properties: Record<string, { schema: NormalizedSchema; required: boolean }>; nullable: boolean }
+  | { kind: "union";        variants: NormalizedSchema[]; nullable: boolean }   // oneOf / anyOf
+  | { kind: "intersection"; parts: NormalizedSchema[] }                          // allOf
+  | { kind: "lazy";         refName: string }                                    // circular → z.lazy()
+  | { kind: "unknown";      warning: string };                                   // unnormalisable
+```
+
+`oneOf` becomes `z.union()`. `allOf` becomes `z.intersection()`. Circular schemas become `z.lazy()`. Nullable fields get `.nullable()`. Every OpenAPI schema quirk is handled once — the emitter just switches on `kind`.
+
+### Session cache
+
+```
+First call:  fetchSpec → dereference → normalize → setCachedIR(specHash, ir, namedSchemas, metadata)
+             ~2-30 seconds (network + swagger-parser)
+
+Subsequent:  getCachedEntry(specHash) → { ir, namedSchemas, metadata }
+             <1ms — no network, no re-parsing
+```
+
+The cache key is SHA-256 of the raw spec bytes. Same URL, same bytes → same cache hit. Different bytes (spec updated) → cache miss and re-normalize automatically.
+
+---
+
+## Quick start
 
 ```bash
 git clone https://github.com/Arjun0014/api-to-mcp-generator
 cd api-to-mcp-generator
-npm install
-npm run build
+npm install && npm run build
 ```
 
-Then register it as an MCP server. In your `.mcp.json` (Claude Code) or `claude_desktop_config.json` (Claude Desktop):
+Register as an MCP server in Claude Code (`.mcp.json`) or Claude Desktop (`claude_desktop_config.json`):
 
 ```json
 {
@@ -52,212 +137,252 @@ Then register it as an MCP server. In your `.mcp.json` (Claude Code) or `claude_
 
 ---
 
-## The 6-tool pipeline
-
-Each tool is independently useful. You can parse without generating, preview schemas without writing files, or run validation on an already-generated server.
+## Tools
 
 ### `parse_openapi_spec`
 
-Fetches and validates an OpenAPI 3.x spec, dereferences all `$ref` links, normalises every operation into a structured summary, and groups them by tag. The parsed IR is cached by spec hash — subsequent tool calls for the same spec hit the cache, not the network.
+Fetches, validates, dereferences, and normalises a spec. Groups operations by tag. Detects auth schemes. For large specs (>100 operations), returns a `groupingRecommendation` — the tag groups, operation counts, and suggested server names — so you can decide which slice to generate.
 
+**Input:**
 ```json
 {
-  "source": { "type": "file", "path": "./tests/fixtures/petstore.yaml" }
+  "source": { "type": "url", "url": "https://petstore.swagger.io/v2/swagger.json" }
 }
 ```
 
-Returns:
-
+**Output (small spec):**
 ```json
 {
-  "title": "Petstore",
-  "operationCount": 5,
+  "title": "Swagger Petstore",
+  "version": "1.0.7",
+  "operationCount": 20,
   "operationsByTag": {
-    "pets":   ["list_pets", "create_pets", "show_pet_by_id", "delete_pet"],
-    "owners": ["list_owners"]
+    "pet":   [{ "toolName": "add_pet", "method": "post", "path": "/pet" }, "..."],
+    "store": ["..."],
+    "user":  ["..."]
   },
-  "detectedAuthSchemes": [],
-  "specHash": "283a89067e..."
+  "detectedAuthSchemes": [{ "type": "api_key_header", "envVar": "API_KEY_HEADER" }],
+  "specHash": "a3f8e2...",
+  "warnings": []
 }
 ```
 
-`operationsByTag` lets you filter large specs before generating. `specHash` is a SHA-256 of the raw spec bytes — the key for session-scoped caching and the provenance record in the manifest.
-
----
-
-### `generate_tool_schemas`
-
-Converts OpenAPI schemas to Zod validation strings per operation. Use this to inspect what input validation will look like before committing to a full server. Also useful if you already have an MCP server and want to pull in just the schemas.
-
+**Output (large spec, >100 ops):**
 ```json
 {
-  "source": { "type": "file", "path": "./tests/fixtures/petstore.yaml" },
-  "operation_ids": ["listPets", "createPets"]
+  "operationCount": 412,
+  "groupingRecommendation": {
+    "strategy": "generate_by_tag",
+    "groups": [
+      { "tag": "charges",   "count": 15, "suggestedServer": "stripe-charges"   },
+      { "tag": "customers", "count": 12, "suggestedServer": "stripe-customers" },
+      { "tag": "products",  "count": 9,  "suggestedServer": "stripe-products"  }
+    ],
+    "totalGroups": 38,
+    "fitsInOneServer": false
+  }
 }
 ```
 
-Returns:
-
-```json
-{
-  "schemas": [
-    {
-      "operation_id": "listPets",
-      "tool_name": "list_pets",
-      "input_schema_zod": "z.object({\n  limit: z.number().int().optional(),\n  tags: z.array(z.string()).optional()\n})"
-    },
-    {
-      "operation_id": "createPets",
-      "tool_name": "create_pets",
-      "input_schema_zod": "z.object({\n  body: z.object({\n    name: z.string(),\n    tag: z.string().optional()\n  })\n})"
-    }
-  ]
-}
-```
-
-Notice: `limit` maps to `z.number().int()` (not `z.number()`), `tag` is `.optional()` because the OpenAPI `required` array only lists `name`, and path params are always required. These are correctness details that template-based generators get wrong.
+Claude reads this and says: *"This spec has 38 groups. Which do you need? I'll generate servers for those."*
 
 ---
 
 ### `write_mcp_server`
 
-Generates and writes the full TypeScript MCP server to disk. Supports `dry_run` to preview the file list before committing, and `force` to overwrite an existing output directory intentionally.
+Generates and writes the full TypeScript MCP server to disk. Writes atomically (temp dir → rename) — no partial output.
 
+**Input:**
 ```json
 {
-  "source": { "type": "file", "path": "./tests/fixtures/petstore.yaml" },
-  "output_dir": "~/generated-mcp/petstore",
-  "server_name": "petstore-api",
-  "dry_run": true
+  "source":      { "type": "url", "url": "https://petstore.swagger.io/v2/swagger.json" },
+  "output_dir":  "~/generated/petstore-pet",
+  "server_name": "petstore-pet",
+  "tag":         "pet",
+  "dry_run":     true
 }
 ```
 
-Files written:
+| Parameter | Description |
+|-----------|-------------|
+| `tag` | Generate only operations from this tag group. Mutually exclusive with `operation_ids`. |
+| `operation_ids` | Generate specific operations by ID or tool name. |
+| `auth_type` | Override detected auth: `bearer`, `api_key_header`, `api_key_query`, `oauth_client_credentials`. |
+| `dry_run` | Return file contents without writing to disk. |
+| `force` | Overwrite existing files. Bypasses collision check only — never bypasses security guards. |
 
-| File | What it is |
-|------|-----------|
-| `src/index.ts` | The MCP server — tools registered, Zod schemas, HTTP dispatch |
-| `src/client.ts` | axios client pre-configured with base URL and auth injection |
-| `package.json` | Ready to `npm install` |
-| `tsconfig.json` | Strict TypeScript config |
-| `.env.example` | Auth token placeholder (populated when auth is detected) |
-| `.mcp-generator-manifest.json` | Provenance record — spec hash, generated tools, options |
+**Files written:**
 
-The manifest is the contract between generation and consumption. Tools 4, 5, and 6 read it instead of re-parsing the spec — which means README and config generation are reproducible independently of the original spec.
+| File | Description |
+|------|-------------|
+| `src/index.ts` | MCP server: Zod-validated tools, `CallToolRequestSchema` handler, `stdio` transport |
+| `src/client.ts` | axios client: base URL + auth injection (or OAuth token fetcher) |
+| `package.json` | Dependencies, build scripts |
+| `tsconfig.json` | Strict TypeScript, CommonJS output |
+| `.env.example` | Auth env var placeholders |
+| `.mcp.json` | Ready to paste into Claude config |
+| `.mcp-generator-manifest.json` | Provenance: spec hash, generated tools, options, timestamp |
 
-**Collision protection:** running `write_mcp_server` twice returns `isError: true` listing conflicting files. Use `dry_run: true` to preview, then `force: true` to overwrite intentionally.
+**Example — generated Zod schema for a real endpoint:**
 
-**Op count guard:** specs with more than 50 operations produce a warning. Specs with more than 100 refuse generation entirely. Use `operation_ids` or tag filtering to select the relevant slice.
+```typescript
+// Generated from OpenAPI: GET /pets?limit=&tags[]=
+const list_petsSchema = z.object({
+  limit: z.number().int().optional(),
+  tags:  z.array(z.string()).optional(),
+});
+```
+
+Notice: `limit` is `.int()` (not just `z.number()`), `tags` is `z.array(z.string())` (not `z.string()`). These details come from the IR normalizer — template generators get them wrong.
+
+---
+
+### `generate_tool_schemas`
+
+Preview Zod schemas without generating a full server. Useful for inspecting normalisation output or pulling schemas into an existing MCP server.
+
+```json
+{
+  "source":       { "type": "file", "path": "./tests/fixtures/petstore.yaml" },
+  "operation_ids": ["listPets", "createPets"]
+}
+```
 
 ---
 
 ### `generate_mcp_config`
 
-Writes the `.mcp.json` config so Claude Code or Claude Desktop can install and run the generated server. Reads the manifest to auto-populate `env` blocks for any detected auth schemes.
-
-```json
-{
-  "output_dir": "~/generated-mcp/petstore",
-  "server_name": "petstore-api"
-}
-```
-
-For a spec with no auth:
+Writes `.mcp.json` from the generation manifest. Auto-populates `env` blocks for detected auth.
 
 ```json
 {
   "mcpServers": {
-    "petstore-api": {
+    "stripe-charges": {
       "command": "node",
-      "args": ["dist/index.js"],
-      "cwd": "/absolute/path/to/generated-mcp/petstore"
+      "args":    ["dist/index.js"],
+      "cwd":     "/Users/you/generated/stripe-charges",
+      "env":     { "BEARER_TOKEN": "" }
     }
   }
 }
 ```
 
-For a spec with Bearer auth, the `env` block is added automatically:
-
-```json
-{
-  "mcpServers": {
-    "petstore-api": {
-      "command": "node",
-      "args": ["dist/index.js"],
-      "cwd": "/absolute/path/to/generated-mcp/petstore",
-      "env": { "BEARER_TOKEN": "" }
-    }
-  }
-}
-```
-
-No manual wiring. The manifest told `generate_mcp_config` exactly which env var to use.
+No manual wiring. The manifest told `generate_mcp_config` which env var to use.
 
 ---
 
 ### `run_validation`
 
-The end-to-end correctness check. Compiles the generated server with `tsc`, builds it, starts it as a child process, then sends it a real MCP `initialize` request followed by `tools/list`. Reports per-phase timing.
+End-to-end correctness check. Runs `tsc --noEmit`, builds the server, spawns it as a child process, and probes it with live MCP `initialize` + `tools/list` messages.
 
 ```json
-{ "output_dir": "~/generated-mcp/petstore" }
+{
+  "output_dir": "~/generated/petstore-pet"
+}
 ```
-
-Output:
 
 ```json
 {
   "passed": true,
-  "tool_count": 5,
-  "tools": ["list_pets", "create_pets", "show_pet_by_id", "delete_pet", "list_owners"],
+  "toolCount": 8,
+  "tools": ["add_pet", "update_pet", "find_pets_by_status", "..."],
   "checks": [
     { "name": "typescript_compile", "passed": true, "elapsedMs": 812 },
     { "name": "server_starts",      "passed": true, "elapsedMs": 420 },
-    { "name": "tools_list",         "passed": true, "elapsedMs": 580, "output": "5 tool(s) registered" }
+    { "name": "tools_list",         "passed": true, "elapsedMs": 580, "output": "8 tool(s)" }
   ]
 }
 ```
 
-This is not just `tsc --noEmit`. The server is actually spawned and probed with live MCP protocol messages. If `tools/list` returns 5 tools, the server speaks MCP correctly.
+This isn't just `tsc --noEmit`. The server is spawned and speaks MCP protocol. If `tools/list` returns 8 tools, the server works.
 
 ---
 
 ### `generate_readme`
 
-Writes a README for the generated server. Reads the manifest — no re-parsing the spec required.
-
-```json
-{
-  "output_dir": "~/generated-mcp/petstore",
-  "server_name": "petstore-api"
-}
-```
+Writes a README for the generated server from the manifest. No re-parsing the spec.
 
 ---
 
 ## Auth support
 
-Auth is auto-detected from OpenAPI `securitySchemes`. Three schemes are supported:
+Auth is auto-detected from `securitySchemes`. Four schemes are supported:
 
-| Scheme | Env var | Injection point |
-|--------|---------|-----------------|
-| `http: bearer` | `BEARER_TOKEN` | `Authorization: Bearer $TOKEN` header |
-| `apiKey: header` | `API_KEY_HEADER` | custom header |
-| `apiKey: query` | `API_KEY_QUERY` | query parameter |
+| Scheme | Env var | Generated injection |
+|--------|---------|---------------------|
+| `http: bearer` | `BEARER_TOKEN` | `Authorization: Bearer $TOKEN` |
+| `apiKey: header` | `API_KEY_HEADER` | custom header name from spec |
+| `apiKey: query` | `API_KEY_QUERY` | query parameter name from spec |
+| OAuth 2.0 `clientCredentials` | `OAUTH_CLIENT_ID` + `OAUTH_CLIENT_SECRET` | auto token fetch + refresh |
 
-Auth flows through three places automatically: `parse_openapi_spec` detects the scheme, `write_mcp_server` injects it into `src/client.ts`, and `generate_mcp_config` adds the `env` block. You set the env var — the generator handles the wiring.
+**OAuth client credentials — what gets generated:**
 
-OAuth flows are not yet supported.
+For specs with `flows.clientCredentials` (Salesforce, HubSpot, enterprise APIs), the generated `client.ts` includes a full token fetcher with caching:
+
+```typescript
+// Generated client.ts — auto token fetch + refresh
+const TOKEN_ENDPOINT = process.env.OAUTH_TOKEN_ENDPOINT ?? "https://auth.example.com/token";
+
+async function getToken(): Promise<string> {
+  if (tokenCache && Date.now() < tokenCache.expiresAt - 60_000) {
+    return tokenCache.token;  // cached
+  }
+  const res = await axios.post(TOKEN_ENDPOINT, {
+    grant_type:    "client_credentials",
+    client_id:     process.env.OAUTH_CLIENT_ID,
+    client_secret: process.env.OAUTH_CLIENT_SECRET,
+  });
+  tokenCache = { token: res.data.access_token, expiresAt: Date.now() + res.data.expires_in * 1000 };
+  return tokenCache.token;
+}
+
+// Every API call gets a fresh (or cached) token automatically
+client.interceptors.request.use(async (config) => {
+  config.headers.Authorization = `Bearer ${await getToken()}`;
+  return config;
+});
+```
+
+Set `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET`. The generated server handles the rest.
+
+> **`authorizationCode` OAuth is intentionally excluded.** That flow requires a browser redirect and user consent screen — incompatible with a headless stdio MCP process. For user-scoped API tokens, paste them as `BEARER_TOKEN` (already supported).
 
 ---
 
-## Security
+## Swagger 2.0 support
 
-**URL sources** — HTTPS only. IPv4 and IPv6 SSRF blocklists applied. Redirect-following disabled.
+Swagger 2.0 specs (Jira Cloud, older Salesforce, many internal enterprise APIs) parse cleanly via a native adapter — no external converter, no new dependencies.
 
-**File sources** — Path traversal protection. Unix `/etc` and Windows `C:\Windows` system paths are blocked. Output directory must be within home or working directory.
+```
+doc.swagger === "2.0"
+  → normalizeSwagger2Doc()
+      ├── definitions        → components/schemas equivalent
+      ├── basePath + host    → baseUrl
+      ├── x-nullable: true   → nullable: true
+      ├── responses[N].schema → (no content wrapper)
+      └── securityDefinitions
+            └── flow: "application" → oauth_client_credentials
 
-**Op count guard** — Refuses to generate servers with more than 100 tools. Warns at 50. Prevents generating an MCP server that Claude cannot reason over.
+doc.openapi.startsWith("3.")
+  → normalizeSpec()  ← unchanged V1 path
+```
+
+Both paths produce identical `NormalizedOperation[]` IR. Everything downstream — emitter, validation, readme — is unchanged.
+
+---
+
+## Security model
+
+| Concern | Mitigation |
+|---------|------------|
+| SSRF via URL specs | HTTPS-only. IPv4 + IPv6 blocklists (RFC1918, link-local, loopback, mapped). Redirects disabled. |
+| Path traversal via output_dir | `validateOutputDir()` blocks system paths, requires home/cwd. |
+| Path traversal via file specs | `validateFilePath()` blocks system paths. |
+| Code injection via schema names | `VALID_IDENTIFIER` check before embedding schema keys as TypeScript identifiers. |
+| Spec size bombs | 10MB raw limit. 25MB dereferenced limit (catches `$ref` expansion). |
+| OAuth token endpoint SSRF | `validateSourceUrl()` applied to `tokenUrl` at codegen time. Invalid URL → empty default + warning. |
+| Prompt injection via spec descriptions | Warning emitted when spec is URL-sourced. Tool descriptions come directly from the spec — review before installing generated servers from untrusted sources. |
+| Unfiltered large specs | 100-operation write guard. Lifted when `tag` or `operation_ids` scopes the request. |
 
 ---
 
@@ -265,52 +390,100 @@ OAuth flows are not yet supported.
 
 ```
 src/
-├── ir/types.ts           — NormalizedOperation, NormalizedSchema discriminated union
-├── security/guards.ts    — validateSourceUrl(), validateOutputDir()
-├── cache.ts              — session-scoped SHA-256-keyed IR cache
+├── ir/
+│   └── types.ts               NormalizedSchema (discriminated union), NormalizedOperation,
+│                              NormCtx (WeakSet ancestor tracking + WeakMap component names)
+├── security/
+│   └── guards.ts              validateSourceUrl() — SSRF (IPv4+IPv6)
+│                              validateOutputDir() — path traversal (Unix+Windows)
+│                              checkRawSize(), checkDereferencedSize()
+├── cache.ts                   SHA-256-keyed session cache
+│                              CacheEntry: { ir, namedSchemas, metadata, parsedAt }
 ├── codegen/
-│   ├── normalizer.ts     — OpenAPI → IR (dispatcher + per-type helpers)
+│   ├── normalizer.ts          normalizeDoc() — version dispatcher
+│   │                          normalizeSpec() — OpenAPI 3.x (two-pass: components then paths)
+│   │                          normalizeSwagger2Doc() — Swagger 2.0 adapter
+│   │                          normalizeSchema() — WeakSet cycle detection → z.lazy()
+│   ├── templates.ts           String fragments (generated file header, .env, package.json)
 │   └── emitters/
-│       ├── index.ts      — emit(ir, "mcp", ctx) protocol-agnostic interface
-│       └── mcp.ts        — MCPEmitter: IR → TypeScript source
-└── tools/                — 6 MCP tool handlers
+│       ├── index.ts           emit(ir, "mcp", ctx) — protocol-agnostic interface
+│       │                      EmitterContext: baseUrl, serverName, authType, tokenEndpoint, namedSchemas
+│       └── mcp.ts             MCPEmitter: IR → TypeScript
+│                              buildIndexTs() — Zod schemas, tool defs, MCP handler
+│                              buildClientTs() — axios client or OAuth token fetcher
+│                              buildLazyConsts() — hoists z.lazy() named schema consts
+└── tools/
+    ├── parse.ts               parse_openapi_spec
+    ├── schemas.ts             generate_tool_schemas
+    ├── write.ts               write_mcp_server
+    ├── config.ts              generate_mcp_config
+    ├── validate.ts            run_validation
+    └── readme.ts              generate_readme
 ```
 
-The IR layer is the core correctness mechanism. It normalises every OpenAPI schema variant — `string`, `enum`, `array`, `object`, `oneOf`, `anyOf`, `allOf`, `nullable`, circular refs — once, in one place. Everything downstream inherits correct output without knowing about OpenAPI at all.
+**Protocol-agnostic emitter interface:**
 
-The emitter interface (`emit(ir, "mcp", ctx)`) is protocol-agnostic by design. Adding a new target (LangChain tools, Vertex AI functions) means writing a new emitter — not touching the normalizer or the tool handlers.
+```typescript
+function emit(
+  ir:       NormalizedOperation[],
+  protocol: "mcp",            // extensible: "openai" | "langchain" coming
+  ctx:      EmitterContext
+): GeneratedServer
+```
+
+The IR layer is the compiler's middle-end. `MCP` is the first back-end. Adding OpenAI function calling, LangChain tools, or Vertex AI function declarations means writing a new emitter file — the normalizer and all six tools stay unchanged.
 
 ---
 
-## Limitations (v1)
+## Real-world tested
 
-| Limitation | Detail |
-|-----------|--------|
-| OpenAPI 3.x only | No Swagger 2.0 support |
-| No OAuth | Bearer token and API key only |
-| No streaming responses | Synchronous HTTP only |
-| No file upload endpoints | `multipart/form-data` not supported |
-| `allOf` with discriminator | Emits `z.unknown()` with a warning — manual review needed |
+| Spec | Format | Ops | Features exercised |
+|------|--------|-----|-------------------|
+| Petstore v2 | Swagger 2.0 | 20 | Swagger adapter, `x-nullable`, apiKey auth, tag filter |
+| Petstore v3 | OpenAPI 3.x | 5 | Baseline, `$ref` resolution |
+| Stripe subset | OpenAPI 3.x | 12 | `allOf`, discriminator, Bearer auth, nullable fields |
+| Jira subset | Swagger 2.0 | 4 | OAuth `flow: application`, `definitions`, `basePath` |
+| Circular schema | OpenAPI 3.x | 1 | `z.lazy()` — `Category.parent: Category` |
+
+All integration tests run E2E: `parse → write → tsc --noEmit --strict → MCP probe`.
 
 ---
 
 ## Development
 
 ```bash
-npm test          # vitest (77 tests)
+npm test          # vitest (105 tests)
 npm run typecheck # tsc --noEmit
-npm run build     # compile to dist/
+npm run build     # compile TypeScript → dist/
 ```
+
+CI runs on every push — Node 18 and Node 20 on ubuntu-latest.
 
 ---
 
-## What's next
+## Limitations
 
-- OAuth 2.0 support (authorization code + client credentials)
-- Swagger 2.0 / OpenAPI 2.x normaliser
-- Tag-based filtering in `write_mcp_server` (generate a subset by tag, not just by operation ID)
-- Streaming response support
-- Claude-assisted tool selection (use the LLM to pick the relevant operations from a large spec)
+| Limitation | Detail |
+|-----------|--------|
+| No `authorizationCode` OAuth | Requires browser redirect — incompatible with headless stdio MCP |
+| No streaming responses | Synchronous HTTP only |
+| No `multipart/form-data` | `formData` parameters warn and are dropped; manual implementation required |
+| `allOf` with discriminator | Emits `z.unknown()` + warning — complex polymorphism needs manual review |
+| Swagger 1.x / RAML / GraphQL | Out of scope |
+
+---
+
+## Roadmap
+
+| Feature | Status |
+|---------|--------|
+| Tag filter + groupingRecommendation | ✅ V2 |
+| `z.lazy()` for circular schemas | ✅ V2 |
+| Swagger 2.0 support | ✅ V2 |
+| OAuth clientCredentials | ✅ V2 |
+| `generate_all_tags` — one command, all groups | Planned V3 |
+| OpenAI function calling emitter | Planned V3 |
+| Spec diff / change detection | Planned V3 |
 
 ---
 

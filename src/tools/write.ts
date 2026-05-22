@@ -4,8 +4,8 @@ import path from "path";
 import { z } from "zod";
 import prettier from "prettier";
 import { SpecSourceSchema, parseSpec } from "./parse.js";
-import { validateOutputDir } from "../security/guards.js";
-import { getCachedIR } from "../cache.js";
+import { validateOutputDir, validateSourceUrl } from "../security/guards.js";
+import { getCachedEntry } from "../cache.js";
 import { emit } from "../codegen/emitters/index.js";
 import { toolSuccess, toolError } from "../types.js";
 import type { GenerationManifest, SpecSource } from "../types.js";
@@ -20,8 +20,9 @@ export const WriteServerInput = z.object({
   output_dir: z.string(),
   server_name: z.string(),
   base_url: z.string().optional(),
-  auth_type: z.enum(["none", "bearer", "api_key_header", "api_key_query"]).optional(),
+  auth_type: z.enum(["none", "bearer", "api_key_header", "api_key_query", "oauth_client_credentials"]).optional(),
   auth_env_var: z.string().optional(),
+  tag: z.string().optional(), // filter to a single tag group; mutually exclusive with operation_ids
   operation_ids: z.array(z.string()).optional(),
   dry_run: z.boolean().default(false),
   force: z.boolean().default(false), // bypasses collision check ONLY — not security guards
@@ -32,23 +33,52 @@ export const WriteServerInput = z.object({
 export async function handleWriteServer(args: unknown) {
   try {
     const input = WriteServerInput.parse(args);
+
+    // Mutual exclusion check first — before any I/O or security guards
+    if (input.tag && input.operation_ids && input.operation_ids.length > 0) {
+      return toolError(
+        "tag and operation_ids cannot be used together. Use either:\n" +
+        "  - tag for group-based generation\n" +
+        "  - operation_ids for explicit selection"
+      );
+    }
+
     const outputDir = validateOutputDir(input.output_dir);
 
     const parsed = await parseSpec(input.source);
-    const ir = getCachedIR(parsed.specHash);
-    if (!ir) throw new Error("IR cache miss after parse — this is a bug");
+    const entry = getCachedEntry(parsed.specHash);
+    if (!entry) throw new Error("IR cache miss after parse — this is a bug");
 
+    const ir = entry.ir;
     let operations = ir;
-    if (input.operation_ids && input.operation_ids.length > 0) {
+    const isFiltered = (input.tag !== undefined) || (input.operation_ids && input.operation_ids.length > 0);
+
+    if (input.tag !== undefined) {
+      operations = ir.filter(op => op.tags.includes(input.tag!));
+      if (operations.length === 0) {
+        const availableTags = [...new Set(ir.flatMap(op => op.tags))].sort().join(", ") || "_untagged";
+        return toolError(
+          `No operations found for tag "${input.tag}". Available tags: ${availableTags}`
+        );
+      }
+    } else if (input.operation_ids && input.operation_ids.length > 0) {
       operations = ir.filter(op =>
         input.operation_ids!.includes(op.operationId) ||
         input.operation_ids!.includes(op.toolName)
       );
       if (operations.length === 0) {
-        throw new Error(
+        return toolError(
           `No operations matched the provided filter. Available: ${ir.map(o => o.toolName).join(", ")}`
         );
       }
+    }
+
+    // Write-side 100-op guard: lifted only when tag or operation_ids scopes the request
+    if (!isFiltered && operations.length > 100) {
+      return toolError(
+        `Spec has ${operations.length} operations (limit: 100 for unfiltered generation). ` +
+        `Use the tag parameter to generate a subset. Available tags: ${Object.keys(parsed.operationsByTag).join(", ")}`
+      );
     }
 
     // Resolve auth: prefer explicit input, fall back to detected
@@ -59,6 +89,26 @@ export async function handleWriteServer(args: unknown) {
       input.auth_env_var ??
       parsed.detectedAuthSchemes[0]?.envVar;
 
+    // Resolve OAuth tokenEndpoint from detected schemes
+    const oauthScheme = parsed.detectedAuthSchemes.find(s => s.type === "oauth_client_credentials");
+    const rawTokenEndpoint = oauthScheme?.tokenEndpoint;
+
+    // SSRF guard on tokenEndpoint at codegen time — embed only if safe.
+    // If the token URL is internal/private, zero it out and warn the FDE to set the env var manually.
+    let tokenEndpoint: string | undefined;
+    const tokenEndpointWarnings: string[] = [];
+    if (rawTokenEndpoint) {
+      try {
+        validateSourceUrl(rawTokenEndpoint);
+        tokenEndpoint = rawTokenEndpoint;
+      } catch {
+        tokenEndpoint = "";
+        tokenEndpointWarnings.push(
+          `OAuth tokenUrl "${rawTokenEndpoint}" failed SSRF validation — set OAUTH_TOKEN_ENDPOINT env var manually in the generated server`
+        );
+      }
+    }
+
     const baseUrl = input.base_url ?? parsed.baseUrl;
 
     const generated = emit(operations, "mcp", {
@@ -66,6 +116,8 @@ export async function handleWriteServer(args: unknown) {
       serverName: input.server_name,
       authType,
       authEnvVar,
+      tokenEndpoint,
+      namedSchemas: entry.namedSchemas,
     });
 
     // Format TypeScript files with prettier
@@ -84,7 +136,7 @@ export async function handleWriteServer(args: unknown) {
       }
     }
 
-    const allWarnings = [...generated.warnings, ...formatWarnings, ...parsed.warnings];
+    const allWarnings = [...generated.warnings, ...formatWarnings, ...parsed.warnings, ...tokenEndpointWarnings];
 
     // Security: warn if the spec was fetched from a URL (untrusted content may embed prompt injection)
     if (input.source.type === "url") {

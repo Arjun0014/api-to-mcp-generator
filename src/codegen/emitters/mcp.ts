@@ -46,6 +46,10 @@ export class MCPEmitter {
     authEnvVar: string
   ): string {
     const header = generatedFileHeader(ctx.serverName);
+
+    // Pre-pass: collect all { kind:"lazy" } schema refNames referenced in this IR,
+    // then emit hoisted z.lazy() const declarations for them.
+    const lazyConsts = this.buildLazyConsts(ir, ctx);
     const zodConsts = ir.map(op => this.buildZodConst(op)).join("\n\n");
     const toolDefs = ir.map(op => this.buildToolDef(op)).join(",\n    ");
     const cases = ir.map(op => this.buildCase(op, ctx)).join("\n      ");
@@ -66,7 +70,7 @@ const server = new Server(
   { capabilities: { tools: {} } }
 );
 
-${zodConsts}
+${lazyConsts}${zodConsts}
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
@@ -106,6 +110,42 @@ void (async () => {
   await server.connect(transport);
 })();
 `;
+  }
+
+  // DFS over namedSchemas AND operation IR to find all { kind:"lazy" } refNames,
+  // then emit hoisted z.lazy() const declarations.
+  // Must cover operation IR too: lazy refs can appear in op params/body/responses
+  // even if not cross-referenced from another named schema.
+  private buildLazyConsts(ir: NormalizedOperation[], ctx: EmitterContext): string {
+    const namedSchemas = ctx.namedSchemas ?? {};
+    const lazyRefNames = new Set<string>();
+
+    // Collect from named component schemas
+    for (const schema of Object.values(namedSchemas)) {
+      collectLazyRefs(schema, lazyRefNames);
+    }
+
+    // Also collect from operation parameter/requestBody/response schemas
+    for (const op of ir) {
+      for (const param of op.parameters) collectLazyRefs(param.schema, lazyRefNames);
+      if (op.requestBody) collectLazyRefs(op.requestBody.schema, lazyRefNames);
+      for (const resp of op.responses) {
+        if (resp.schema) collectLazyRefs(resp.schema, lazyRefNames);
+      }
+    }
+
+    if (lazyRefNames.size === 0) return "";
+
+    const consts: string[] = [];
+    for (const refName of lazyRefNames) {
+      const schema = namedSchemas[refName];
+      if (!schema) continue;
+      // Build the body with cycle-break: nested lazy with same refName emits z.lazy(() => refName)
+      const body = schemaToZodBase(schema);
+      consts.push(`const ${refName}Schema: z.ZodTypeAny = z.lazy(() => ${body});`);
+    }
+
+    return consts.join("\n") + "\n\n";
   }
 
   private buildZodConst(op: NormalizedOperation): string {
@@ -167,6 +207,11 @@ void (async () => {
 
   private buildClientTs(ctx: EmitterContext, authEnvVar: string): string {
     const header = generatedFileHeader(ctx.serverName);
+
+    if (ctx.authType === "oauth_client_credentials") {
+      return this.buildOAuthClientTs(ctx, header);
+    }
+
     const authHeader = buildAuthInjection(ctx.authType, authEnvVar);
     const authComment =
       ctx.authType !== "none"
@@ -192,6 +237,73 @@ const client = axios.create({
 });
 
 export { client };
+`;
+  }
+
+  private buildOAuthClientTs(ctx: EmitterContext, header: string): string {
+    // SSRF guard on tokenEndpoint was applied at call site (write.ts) before reaching here.
+    // If tokenEndpoint failed validation it arrives as empty string; use env var only.
+    const tokenEndpointDefault = ctx.tokenEndpoint ?? "";
+
+    return `${header}
+import axios from "axios";
+
+// OAuth 2.0 clientCredentials auto-token fetcher.
+// Set OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, and optionally OAUTH_TOKEN_ENDPOINT.
+// The token endpoint defaults to the value from the API spec.
+
+const TOKEN_ENDPOINT = process.env.OAUTH_TOKEN_ENDPOINT ?? ${JSON.stringify(tokenEndpointDefault)};
+
+interface TokenCache {
+  token: string;
+  expiresAt: number;
+}
+
+let tokenCache: TokenCache | null = null;
+
+async function getToken(): Promise<string> {
+  if (tokenCache && Date.now() < tokenCache.expiresAt - 60_000) {
+    return tokenCache.token;
+  }
+  let res: Awaited<ReturnType<typeof axios.post<{ access_token: string; expires_in: number }>>>;
+  try {
+    res = await axios.post<{ access_token: string; expires_in: number }>(
+      TOKEN_ENDPOINT,
+      new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: process.env.OAUTH_CLIENT_ID ?? "",
+        client_secret: process.env.OAUTH_CLIENT_SECRET ?? "",
+      }),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10_000 }
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(\`OAuth token fetch failed (\${TOKEN_ENDPOINT}): \${msg}\`);
+  }
+  // Default to 1 hour when expires_in is missing, zero, or negative (RFC 6749 allows omission).
+  const expiresIn = typeof res.data.expires_in === "number" && res.data.expires_in > 0
+    ? res.data.expires_in
+    : 3600;
+  tokenCache = {
+    token: res.data.access_token,
+    expiresAt: Date.now() + expiresIn * 1000,
+  };
+  return tokenCache.token;
+}
+
+export const client = axios.create({
+  baseURL: ${JSON.stringify(ctx.baseUrl)},
+  timeout: 30000,
+  headers: {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+  },
+});
+
+client.interceptors.request.use(async (config) => {
+  config.headers.Authorization = \`Bearer \${await getToken()}\`;
+  return config;
+});
 `;
   }
 }
@@ -253,6 +365,10 @@ function schemaToZodBase(schema: NormalizedSchema): string {
           schemaToZodStr(schema.parts[0]!)
         );
 
+    case "lazy":
+      // References a named circular schema — the const is hoisted at file top by the emitter.
+      return `z.lazy(() => ${schema.refName}Schema)`;
+
     case "unknown":
       return "z.unknown()";
   }
@@ -260,17 +376,18 @@ function schemaToZodBase(schema: NormalizedSchema): string {
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
-function defaultEnvVar(authType: "none" | "bearer" | "api_key_header" | "api_key_query"): string {
+function defaultEnvVar(authType: EmitterContext["authType"]): string {
   switch (authType) {
     case "bearer": return "BEARER_TOKEN";
     case "api_key_header": return "API_KEY_HEADER";
     case "api_key_query": return "API_KEY_QUERY";
+    case "oauth_client_credentials": return "OAUTH_CLIENT_ID";
     default: return "";
   }
 }
 
 function buildAuthInjection(
-  authType: "none" | "bearer" | "api_key_header" | "api_key_query",
+  authType: EmitterContext["authType"],
   envVar: string
 ): string {
   switch (authType) {
@@ -280,6 +397,8 @@ function buildAuthInjection(
       return `...(process.env.${envVar} ? { "X-API-Key": process.env.${envVar} } : {})`;
     case "api_key_query":
       return ""; // query params injected per-request, not in headers
+    case "oauth_client_credentials":
+      return ""; // token injected via axios interceptor in buildClientTs
     default:
       return "";
   }
@@ -301,6 +420,32 @@ function sanitizeKey(key: string): string {
   // For Zod object keys and property access: valid identifiers used as-is, others quoted.
   if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key)) return key;
   return JSON.stringify(key);
+}
+
+// DFS over a NormalizedSchema tree; collects all { kind:"lazy" } refNames.
+// Used by buildLazyConsts to determine which named schemas need hoisted z.lazy() declarations.
+function collectLazyRefs(schema: NormalizedSchema, out: Set<string>): void {
+  switch (schema.kind) {
+    case "lazy":
+      out.add(schema.refName);
+      break;
+    case "array":
+      collectLazyRefs(schema.items, out);
+      break;
+    case "object":
+      for (const { schema: s } of Object.values(schema.properties)) {
+        collectLazyRefs(s, out);
+      }
+      break;
+    case "union":
+      for (const v of schema.variants) collectLazyRefs(v, out);
+      break;
+    case "intersection":
+      for (const p of schema.parts) collectLazyRefs(p, out);
+      break;
+    default:
+      break;
+  }
 }
 
 // Inlined into every generated server — converts Zod schemas to JSON Schema for MCP tool definitions.

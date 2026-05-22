@@ -1,0 +1,141 @@
+swagger: "2.0"
+info:
+  title: Jira API Subset
+  version: "1001.0.0"
+  description: Subset of Jira REST API for testing Swagger 2.0 normalization
+host: your-instance.atlassian.net
+basePath: /rest/api/3
+schemes:
+  - https
+securityDefinitions:
+  OAuth2:
+    type: oauth2
+    flow: application
+    tokenUrl: https://auth.atlassian.com/oauth/token
+    scopes:
+      read:jira-work: Read Jira work data
+  ApiKeyAuth:
+    type: apiKey
+    in: header
+    name: Authorization
+security:
+  - OAuth2:
+      - read:jira-work
+paths:
+  /project:
+    get:
+      operationId: getAllProjects
+      summary: Get all projects
+      description: Returns all projects visible to the user.
+      tags:
+        - project
+      parameters:
+        - name: expand
+          in: query
+          description: Fields to expand
+          required: false
+          type: string
+      responses:
+        "200":
+          description: Returned if the request is successful.
+          schema:
+            $ref: "#/definitions/PageBeanProject"
+        "401":
+          description: Returned if the authentication credentials are incorrect.
+  /project/{projectIdOrKey}:
+    get:
+      operationId: getProject
+      summary: Get project
+      tags:
+        - project
+      parameters:
+        - name: projectIdOrKey
+          in: path
+          required: true
+          type: string
+          description: The project ID or project key
+      responses:
+        "200":
+          description: Returned if successful.
+          schema:
+            $ref: "#/definitions/Project"
+        "404":
+          description: Returned if the project is not found.
+  /issue:
+    post:
+      operationId: createIssue
+      summary: Create issue
+      tags:
+        - issues
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/IssueUpdateDetails"
+      responses:
+        "201":
+          description: Returned if the request is successful.
+          schema:
+            $ref: "#/definitions/CreatedIssue"
+  /issue/{issueIdOrKey}:
+    get:
+      operationId: getIssue
+      summary: Get issue
+      tags:
+        - issues
+      parameters:
+        - name: issueIdOrKey
+          in: path
+          required: true
+          type: string
+      responses:
+        "200":
+          description: Returned if the request is successful.
+          schema:
+            $ref: "#/definitions/IssueBean"
+definitions:
+  Project:
+    type: object
+    properties:
+      id:
+        type: string
+      key:
+        type: string
+      name:
+        type: string
+        x-nullable: true
+      description:
+        type: string
+        x-nullable: true
+  PageBeanProject:
+    type: object
+    properties:
+      total:
+        type: integer
+      values:
+        type: array
+        items:
+          $ref: "#/definitions/Project"
+  IssueBean:
+    type: object
+    properties:
+      id:
+        type: string
+      key:
+        type: string
+      fields:
+        type: object
+  IssueUpdateDetails:
+    type: object
+    properties:
+      fields:
+        type: object
+        description: Fields to update
+  CreatedIssue:
+    type: object
+    properties:
+      id:
+        type: string
+      key:
+        type: string
